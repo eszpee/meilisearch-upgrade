@@ -4,6 +4,8 @@ A simple bash script to safely upgrade self-hosted [Meilisearch](https://www.mei
 
 This script automates this upgrade process for Meilisearch instances running in a Docker Compose environment.
 
+*Note that if you want to try the experimental dumpless upgrade feature of Meilisearch, you need to add `MEILI_EXPERIMENTAL_DUMPLESS_UPGRADE=true` to your Docker Compose environment, and then if all goes well, you will not need this script. Good luck!*
+
 ## Features
 
 - **Safe upgrades** with automatic database backups
