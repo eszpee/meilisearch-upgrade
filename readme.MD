@@ -1,4 +1,4 @@
-# Meilisearch Docker Upgrade Script
+# Meilisearch Docker Compose Upgrade Script
 
 A simple bash script to safely upgrade self-hosted [Meilisearch](https://www.meilisearch.com/) instances running in Docker Compose. Meilisearch databases are only compatible with the version of Meilisearch used to create them, so the recommended upgrade method is to create a full data dump and reload it into the engine after upgrading. [See more here.](https://www.meilisearch.com/docs/learn/update_and_migration/updating#updating-a-self-hosted-meilisearch-instance)
 
