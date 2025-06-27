@@ -88,8 +88,14 @@ if [[ "$1" == "--recover" ]]; then
     elif docker volume inspect "$FULL_VOLUME_NAME" >/dev/null 2>&1; then
         ACTUAL_VOLUME_NAME="$FULL_VOLUME_NAME"
     else
-        echo "Error: Could not find volume"
-        exit 1
+        # Try to find any volume containing meili_data
+        FOUND_VOLUME=$(docker volume ls --format "{{.Name}}" | grep "${VOLUME_NAME}" | head -1)
+        if [[ -n "$FOUND_VOLUME" ]]; then
+            ACTUAL_VOLUME_NAME="$FOUND_VOLUME"
+        else
+            echo "Error: Could not find volume"
+            exit 1
+        fi
     fi
     
     # Find the most recent backup
@@ -293,16 +299,26 @@ echo "Backing up database..."
 PROJECT_NAME=$(basename "$(pwd)")
 FULL_VOLUME_NAME="${PROJECT_NAME}_${VOLUME_NAME}"
 
-# Try to find the actual volume name
+# Try to find the actual volume name - check multiple possibilities
 if docker volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
     ACTUAL_VOLUME_NAME="$VOLUME_NAME"
 elif docker volume inspect "$FULL_VOLUME_NAME" >/dev/null 2>&1; then
     ACTUAL_VOLUME_NAME="$FULL_VOLUME_NAME"
 else
-    echo "Error: Could not find volume. Tried: $VOLUME_NAME and $FULL_VOLUME_NAME"
-    echo "Available volumes:"
-    docker volume ls | grep meili
-    exit 1
+    # Try to find any volume containing meili_data
+    FOUND_VOLUME=$(docker volume ls --format "{{.Name}}" | grep "${VOLUME_NAME}" | head -1)
+    if [[ -n "$FOUND_VOLUME" ]]; then
+        ACTUAL_VOLUME_NAME="$FOUND_VOLUME"
+        echo "Found volume: $ACTUAL_VOLUME_NAME"
+    else
+        echo "Error: Could not find volume. Tried: $VOLUME_NAME and $FULL_VOLUME_NAME"
+        echo "Available volumes:"
+        docker volume ls | grep meili
+        echo ""
+        echo "Please update the VOLUME_NAME variable in the script to match your actual volume name."
+        echo "Based on the output above, try setting: VOLUME_NAME=\"docker_meili_data\""
+        exit 1
+    fi
 fi
 
 echo "Using volume: $ACTUAL_VOLUME_NAME"
