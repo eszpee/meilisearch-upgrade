@@ -26,7 +26,7 @@ set -e
 # Configuration
 COMPOSE_FILE="../docker-compose.yml"
 MEILISEARCH_SERVICE="meilisearch"
-VOLUME_NAME="meili_data"
+VOLUME_NAME="docker_meili_data"
 
 # Load environment variables
 if [[ -f ".env" ]]; then
@@ -100,7 +100,10 @@ if [[ "$1" == "--recover" ]]; then
     
     # Find the most recent backup
     echo "Looking for database backup..."
-    BACKUP_FILE=$(docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -t /meili_data/data.ms_*.backup 2>/dev/null | head -1" || echo "")
+    echo "Available files matching pattern:"
+    docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -la /meili_data/data.ms_*.backup 2>/dev/null || echo 'No backup files found'"
+    
+    BACKUP_FILE=$(docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -t /meili_data/data.ms_*.backup 2>/dev/null | grep -E 'data\.ms_[0-9_]+_[v][0-9]+\.[0-9]+\.[0-9]+\.backup$' | head -1" || echo "")
     
     if [[ -z "$BACKUP_FILE" ]]; then
         echo "No automatic database backup found."
@@ -114,36 +117,157 @@ if [[ "$1" == "--recover" ]]; then
             CURRENT_VERSION=$(grep -oP 'getmeili/meilisearch:\K[v0-9.]+' "$COMPOSE_FILE" | head -1)
             echo "Current version in compose file: $CURRENT_VERSION"
             
-            # Try to revert to a known working version
-            echo ""
-            echo "Available options:"
-            echo "1. Enter a specific version (e.g., v1.15.0)"
-            echo "2. Cancel recovery"
-            echo ""
-            read -p "Enter version to revert to (or 'cancel'): " REVERT_VERSION
+            # Check for available dumps
+            echo "Checking for available dump files..."
+            AVAILABLE_DUMPS=$(docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -t /meili_data/dumps/*.dump 2>/dev/null | head -5" || echo "")
             
-            if [[ "$REVERT_VERSION" == "cancel" || -z "$REVERT_VERSION" ]]; then
-                echo "Recovery cancelled."
-                exit 1
+            if [[ -n "$AVAILABLE_DUMPS" ]]; then
+                echo "Found dump files. Would you like to:"
+                echo "1. Restore from the most recent dump file"
+                echo "2. Enter a specific version to revert to"
+                echo "3. Cancel recovery"
+                echo ""
+                read -p "Choose option (1/2/3): " RECOVERY_OPTION
+                
+                if [[ "$RECOVERY_OPTION" == "1" ]]; then
+                    # Show available dumps and let user choose
+                    echo "Available dump files:"
+                    docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -lt /meili_data/dumps/*.dump 2>/dev/null | head -10"
+                    
+                    echo ""
+                    echo "Please choose a dump file:"
+                    echo "1. Use most recent dump (may be from newer version)"
+                    echo "2. Use dump with matching version (if available)"
+                    echo "3. Enter specific dump filename"
+                    echo "4. Cancel"
+                    echo ""
+                    read -p "Choose option (1/2/3/4): " DUMP_CHOICE
+                    
+                    if [[ "$DUMP_CHOICE" == "1" ]]; then
+                        LATEST_DUMP=$(docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -t /meili_data/dumps/*.dump 2>/dev/null | head -1" || echo "")
+                        DUMP_FILENAME=$(basename "$LATEST_DUMP")
+                    elif [[ "$DUMP_CHOICE" == "2" ]]; then
+                        # Try to find a dump with matching version
+                        CURRENT_VERSION=$(grep -oP 'getmeili/meilisearch:\K[v0-9.]+' "$COMPOSE_FILE" | head -1)
+                        MATCHING_DUMP=$(docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -t /meili_data/dumps/*${CURRENT_VERSION}*.dump 2>/dev/null | head -1" || echo "")
+                        if [[ -n "$MATCHING_DUMP" ]]; then
+                            DUMP_FILENAME=$(basename "$MATCHING_DUMP")
+                            echo "Found matching dump: $DUMP_FILENAME"
+                        else
+                            echo "No dump found for version $CURRENT_VERSION, using most recent..."
+                            LATEST_DUMP=$(docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "ls -t /meili_data/dumps/*.dump 2>/dev/null | head -1" || echo "")
+                            DUMP_FILENAME=$(basename "$LATEST_DUMP")
+                        fi
+                    elif [[ "$DUMP_CHOICE" == "3" ]]; then
+                        read -p "Enter dump filename: " DUMP_FILENAME
+                    else
+                        echo "Recovery cancelled."
+                        exit 1
+                    fi
+                    
+                    if [[ -n "$DUMP_FILENAME" ]]; then
+                        echo "Using dump file: $DUMP_FILENAME"
+                        
+                        # Extract version from dump filename if possible
+                        DUMP_VERSION=$(echo "$DUMP_FILENAME" | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+                        if [[ -n "$DUMP_VERSION" ]]; then
+                            echo "Detected version from dump: $DUMP_VERSION"
+                            REVERT_VERSION="$DUMP_VERSION"
+                        else
+                            echo "Could not detect version from dump filename."
+                            read -p "Enter version to use (e.g., v1.15.0): " REVERT_VERSION
+                        fi
+                        
+                        # Add 'v' prefix if not provided
+                        if [[ ! "$REVERT_VERSION" =~ ^v ]]; then
+                            REVERT_VERSION="v$REVERT_VERSION"
+                        fi
+                        
+                        echo "Reverting to $REVERT_VERSION and importing dump..."
+                        sed -i "s|getmeili/meilisearch:[v0-9.]*|getmeili/meilisearch:$REVERT_VERSION|g" "$COMPOSE_FILE"
+                        
+                        # Remove current database and import dump
+                        docker run --rm -v "$ACTUAL_VOLUME_NAME":/meili_data alpine sh -c "rm -rf /meili_data/data.ms"
+                        
+                        echo "Starting meilisearch with $REVERT_VERSION and importing dump..."
+                        echo "Note: This may take several minutes depending on dump size..."
+                        
+                        # Try to import with timeout, but allow longer for large dumps
+                        timeout 600 docker compose run --rm meilisearch \
+                            meilisearch --import-dump "/meili_data/dumps/$DUMP_FILENAME" --master-key="$MEILI_MASTER_KEY" || {
+                            echo "Import process completed (or timed out after 10 minutes)"
+                            echo "Checking if import was successful..."
+                        }
+                        
+                        echo "Starting meilisearch service..."
+                        docker compose up -d meilisearch
+                        
+                        echo ""
+                        echo "Recovery completed!"
+                        echo "- Reverted to: $REVERT_VERSION"
+                        echo "- Imported from dump: $DUMP_FILENAME"
+                        echo "- You can now run the upgrade script normally"
+                        exit 0
+                    fi
+                elif [[ "$RECOVERY_OPTION" == "2" ]]; then
+                    read -p "Enter version to revert to (e.g., v1.15.0): " REVERT_VERSION
+                    
+                    if [[ "$REVERT_VERSION" == "cancel" || -z "$REVERT_VERSION" ]]; then
+                        echo "Recovery cancelled."
+                        exit 1
+                    fi
+                    
+                    # Add 'v' prefix if not provided
+                    if [[ ! "$REVERT_VERSION" =~ ^v ]]; then
+                        REVERT_VERSION="v$REVERT_VERSION"
+                    fi
+                    
+                    echo "Reverting to $REVERT_VERSION..."
+                    sed -i "s|getmeili/meilisearch:[v0-9.]*|getmeili/meilisearch:$REVERT_VERSION|g" "$COMPOSE_FILE"
+                    
+                    echo "Starting meilisearch with $REVERT_VERSION..."
+                    docker compose up -d meilisearch
+                    
+                    echo ""
+                    echo "Recovery completed!"
+                    echo "- Reverted to: $REVERT_VERSION"
+                    echo "- Kept existing database"
+                    echo "- You can now run the upgrade script normally"
+                    exit 0
+                else
+                    echo "Recovery cancelled."
+                    exit 1
+                fi
+            else
+                echo "No dump files found. Available options:"
+                echo "1. Enter a specific version (e.g., v1.15.0)"
+                echo "2. Cancel recovery"
+                echo ""
+                read -p "Enter version to revert to (or 'cancel'): " REVERT_VERSION
+                
+                if [[ "$REVERT_VERSION" == "cancel" || -z "$REVERT_VERSION" ]]; then
+                    echo "Recovery cancelled."
+                    exit 1
+                fi
+                
+                # Add 'v' prefix if not provided
+                if [[ ! "$REVERT_VERSION" =~ ^v ]]; then
+                    REVERT_VERSION="v$REVERT_VERSION"
+                fi
+                
+                echo "Reverting to $REVERT_VERSION..."
+                sed -i "s|getmeili/meilisearch:[v0-9.]*|getmeili/meilisearch:$REVERT_VERSION|g" "$COMPOSE_FILE"
+                
+                echo "Starting meilisearch with $REVERT_VERSION..."
+                docker compose up -d meilisearch
+                
+                echo ""
+                echo "Recovery completed!"
+                echo "- Reverted to: $REVERT_VERSION"
+                echo "- Kept existing database"
+                echo "- You can now run the upgrade script normally"
+                exit 0
             fi
-            
-            # Add 'v' prefix if not provided
-            if [[ ! "$REVERT_VERSION" =~ ^v ]]; then
-                REVERT_VERSION="v$REVERT_VERSION"
-            fi
-            
-            echo "Reverting to $REVERT_VERSION..."
-            sed -i "s|getmeili/meilisearch:[v0-9.]*|getmeili/meilisearch:$REVERT_VERSION|g" "$COMPOSE_FILE"
-            
-            echo "Starting meilisearch with $REVERT_VERSION..."
-            docker compose up -d meilisearch
-            
-            echo ""
-            echo "Recovery completed!"
-            echo "- Reverted to: $REVERT_VERSION"
-            echo "- Kept existing database"
-            echo "- You can now run the upgrade script normally"
-            exit 0
         else
             echo "No database found either. You may need to restore from a dump file."
             echo "Available dump files:"
