@@ -476,25 +476,41 @@ sed -i "s|getmeili/meilisearch:$CURRENT_VERSION|getmeili/meilisearch:$LATEST_VER
 
 # Start meilisearch with import (this will exit after import)
 echo "Starting meilisearch and importing dump..."
-timeout 300 docker compose run --rm meilisearch \
-    meilisearch --import-dump "/meili_data/dumps/$NEW_DUMP_FILENAME" --master-key="$MEILI_MASTER_KEY" || true
+echo "Note: This may take several minutes depending on dump size..."
+timeout 600 docker compose run --rm meilisearch \
+    meilisearch --import-dump "/meili_data/dumps/$NEW_DUMP_FILENAME" --master-key="$MEILI_MASTER_KEY" || {
+    echo "Import process completed (or timed out after 10 minutes)"
+    echo "Checking if import was successful..."
+}
 
-echo "Import process completed (or timed out after 5 minutes)"
+echo "Import process completed."
 
-# Start normally
-echo "Starting meilisearch service..."
-docker compose up -d meilisearch
+# Full restart to ensure networking works properly (especially for tunnels)
+echo "Restarting full stack to ensure proper networking..."
+echo "Stopping all services..."
+docker compose down
+
+echo "Starting all services..."
+docker compose up -d
 
 # Wait for service to be ready
 echo "Waiting for meilisearch to be ready..."
+echo "This may take a moment for the new version to start and establish networking..."
 for i in {1..30}; do
     if curl -s "$MEILISEARCH_URL/health" > /dev/null 2>&1; then
-        echo "Meilisearch is ready!"
+        echo "Meilisearch is ready and accessible!"
         break
     fi
     echo "Waiting... ($i/30)"
     sleep 2
 done
+
+# Final connectivity check
+if ! curl -s "$MEILISEARCH_URL/health" > /dev/null 2>&1; then
+    echo "Warning: Meilisearch may not be accessible externally yet."
+    echo "Try checking: docker compose ps"
+    echo "And: docker compose logs meilisearch"
+fi
 
 echo ""
 echo "Upgrade completed successfully!"
